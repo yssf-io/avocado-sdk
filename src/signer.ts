@@ -6,7 +6,7 @@ import { JsonRpcSigner, StaticJsonRpcProvider } from '@ethersproject/providers'
 import { keccak256 } from '@ethersproject/solidity'
 import { Bytes, hexlify } from "@ethersproject/bytes";
 import { toUtf8Bytes } from "@ethersproject/strings";
-import { BigNumber, constants, ethers } from 'ethers'
+import { BigNumber, Contract, constants, ethers, utils } from 'ethers'
 import { avoContracts, AvoSafeVersion } from './contracts'
 import { getRpcProvider } from './providers'
 import { parse } from 'semver';
@@ -83,6 +83,34 @@ const typesV2 = {
   ],
 };
 
+const typesMultisig = {
+  Action: [
+    { name: "target", type: "address" },
+    { name: "data", type: "bytes" },
+    { name: "value", type: "uint256" },
+    { name: "operation", type: "uint256" },
+  ],
+  Cast: [
+    { name: "params", type: "CastParams" },
+    { name: "forwardParams", type: "CastForwardParams" },
+  ],
+  CastForwardParams: [
+    { name: "gas", type: "uint256" },
+    { name: "gasPrice", type: "uint256" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validUntil", type: "uint256" },
+    { name: "value", type: "uint256" },
+  ],
+  CastParams: [
+    { name: "actions", type: "Action[]" },
+    { name: "id", type: "uint256" },
+    { name: "avoNonce", type: "int256" },
+    { name: "salt", type: "bytes32" },
+    { name: "source", type: "address" },
+    { name: "metadata", type: "bytes" },
+  ],
+};
+
 class AvoSigner extends Signer implements TypedDataSigner {
   _avoWallet?: AvoWalletV3
   _polygonForwarder: AvoForwarder
@@ -142,6 +170,17 @@ class AvoSigner extends Signer implements TypedDataSigner {
     return this._avoWallet!.address
   }
 
+  async getAddressMultisig(index: number): Promise<string> {
+    const avoForwarder = new Contract(
+      "0x46978CD477A496028A18c02F07ab7F35EDBa5A54",
+      new utils.Interface([
+        "function computeAvocado(address owner, uint32 index) view external returns(address)",
+      ]),
+      getRpcProvider(137)
+    );
+    return await avoForwarder.computeAvocado(await this.getOwnerAddress(), index)
+  }
+
   async getOwnerAddress(): Promise<string> {
     return await this.signer.getAddress()
   }
@@ -152,6 +191,22 @@ class AvoSigner extends Signer implements TypedDataSigner {
     const owner = await this.getOwnerAddress()
 
     const avoSafeNonce = await forwarder.avoSafeNonce(owner).then(String)
+
+    return avoSafeNonce
+  }
+
+  async getSafeNonceMultisig(chainId: number, index: number): Promise<string> {
+    const owner = await this.getOwnerAddress()
+
+    const avoForwarder = new Contract(
+      "0x46978CD477A496028A18c02F07ab7F35EDBa5A54",
+      new utils.Interface([
+        "function avoNonce(address owner, uint32 index) view external returns(uint256)",
+      ]),
+      getRpcProvider(chainId)
+    );
+
+    const avoSafeNonce = await avoForwarder.avoNonce(owner, index).then(String);
 
     return avoSafeNonce
   }
@@ -207,6 +262,37 @@ class AvoSigner extends Signer implements TypedDataSigner {
     }
   }
 
+  async generateSignatureMessageMultisig(transactions: Deferrable<RawTransaction>[], targetChainId: number, index: number, options?: SignatureOption) {
+    await this.syncAccount(options)
+
+    const avoNonce = options && typeof options.avoSafeNonce !== 'undefined' ? String(options.avoSafeNonce) : await this.getSafeNonceMultisig(targetChainId, index)
+
+    return {
+      params: {
+        actions: transactions.map((transaction) => {
+          return {
+            operation: transaction.operation || "0",
+            target: transaction.to,
+            data: transaction.data || "0x",
+            value: transaction.value ? transaction.value.toString() : "0",
+          };
+        }),
+        id: "0",
+        avoNonce,
+        salt: constants.HashZero, // TODO: compute salt
+        source: "0xE8385fB3A5F15dED06EB5E20E5A81BF43115eb8E", // is this right?
+        metadata: "0x00", // TODO: compute metadata
+      },
+      forwardParams: {
+        gas: "0",
+        gasPrice: "0",
+        validUntil: "0",
+        validAfter: "0",
+        value: "0",
+      },
+    };
+  }
+
   async sendTransaction(transaction: Deferrable<RawTransaction>, options?: SignatureOption): Promise<TransactionResponse> {
     return await this.sendTransactions([transaction], await transaction.chainId, options);
   }
@@ -236,6 +322,35 @@ class AvoSigner extends Signer implements TypedDataSigner {
     }, options)
 
     return this.broadcastSignedMessage({ message, chainId, signature, safeAddress: options?.safeAddress });
+  }
+
+  async sendTransactionsMultisig(transactions: Deferrable<RawTransaction>[], index: number, targetChainId?: Deferrable<number>, options?: SignatureOption): Promise<TransactionResponse> {
+    await this.syncAccount(options)
+
+    if (await this._chainId !== AVOCADO_CHAIN_ID) {
+      throw new Error(`Signer provider chain id should be ${AVOCADO_CHAIN_ID}`)
+    }
+
+    const chainId: number | undefined = this.customChainId || (await targetChainId)
+
+    if (!chainId) {
+      throw new Error('Chain ID is required')
+    }
+
+    const message = await this.generateSignatureMessageMultisig(
+      transactions,
+      chainId,
+      index,
+      options
+    );
+
+    const signature = await this.buildSignatureMultisig({
+      message,
+      chainId,
+      index
+    }, options)
+
+    return this.broadcastSignedMessageMultisig({ message, chainId, signature, index });
   }
 
   async broadcastSignedMessage({ message, chainId, signature, safeAddress, name, version }: { message: any, chainId: number, signature: string, safeAddress?: string, name?: string, version?: string }) {
@@ -290,6 +405,60 @@ class AvoSigner extends Signer implements TypedDataSigner {
         safe: safeAddress || await this.getAddress(),
         digestHash
       }
+    ])
+
+    if (transactionHash === '0x') {
+      throw new Error('Tx failed!')
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 2000))
+
+    let tx = await getRpcProvider(chainId).getTransaction(transactionHash)
+
+    if (!tx) {
+      tx = await new Promise(resolve => setTimeout(resolve, 2000))
+    }
+
+    if (!tx) {
+      tx = await new Promise(resolve => setTimeout(resolve, 2000))
+    }
+
+    if (tx) {
+      return tx
+    }
+
+    return {
+      from: owner,
+      nonce: 0,
+      confirmations: 0,
+      chainId,
+      data: '0x',
+      gasLimit: BigNumber.from(0),
+      value: BigNumber.from(0),
+      hash: transactionHash,
+      wait: async (confirmations?: number) => {
+        return await getRpcProvider(chainId).waitForTransaction(transactionHash, confirmations || 0)
+      }
+    }
+  }
+
+  async broadcastSignedMessageMultisig({ message, chainId, signature, index }: { message: any, chainId: number, signature: string, index: number }) {
+    const owner = await this.getOwnerAddress()
+
+    const transactionHash = await this._avoProvider.send('txn_broadcast', [
+      {
+        signatures: [
+          {
+            signature,
+            signer: await this.getOwnerAddress(),
+          },
+        ],
+        message,
+        owner: await this.getOwnerAddress(),
+        safe: await this.getAddressMultisig(index),
+        targetChainId: String(chainId),
+        index: "0",
+      },
     ])
 
     if (transactionHash === '0x') {
@@ -421,6 +590,46 @@ class AvoSigner extends Signer implements TypedDataSigner {
       1: typesV1,
       2: typesV2,
     }[versionMajor] || {}
+
+    // Adding values for types mentioned
+    const value = message
+
+    return await this._signTypedData(domain, types, value)
+  }
+
+  async buildSignatureMultisig({ message, chainId, index }: { message: any, chainId: number, index: number }, options?: SignatureOption) {
+    await this.syncAccount(options)
+
+    const owner = await this.getOwnerAddress()
+
+    const avoForwarder = new Contract(
+      "0x46978CD477A496028A18c02F07ab7F35EDBa5A54",
+      new utils.Interface([
+        "function avocadoVersion(address owner, uint32 index) view external returns(string)",
+        "function avocadoVersionName(address owner, uint32 index) view external returns(string)",
+      ]),
+      getRpcProvider(chainId)
+    );
+
+    let name = options?.name
+    let version = options?.version
+
+    if (!name || !version) {
+      version = await avoForwarder.avocadoVersion(owner, index)
+      name = await avoForwarder.avocadoVersionName(owner, index)
+    }
+
+    // Creating domain for signing using Avocado wallet address as the verifying contract
+    const domain = {
+      name,
+      version,
+      chainId: String(AVOCADO_CHAIN_ID),
+      salt: keccak256(['uint256'], [chainId]),
+      verifyingContract: options?.safeAddress || await this.getAddressMultisig(index)
+    }
+
+    // The named list of all type definitions
+    const types = typesMultisig;
 
     // Adding values for types mentioned
     const value = message
